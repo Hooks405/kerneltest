@@ -45,6 +45,10 @@ struct cpufreq_suspend_t {
 
 static DEFINE_PER_CPU(struct cpufreq_suspend_t, cpufreq_suspend);
 
+#ifdef CONFIG_ARCH_MSM8939
+extern int jig_boot_clk_limit;
+#endif
+
 static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 			unsigned int index)
 {
@@ -75,6 +79,24 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 	trace_cpu_frequency_switch_start(freqs.old, freqs.new, policy->cpu);
 
 	rate = new_freq * 1000;
+#ifdef CONFIG_ARCH_MSM8939
+#if defined(CONFIG_SEC_A7_PROJECT)
+  #define JIG_LIMIT_CLK	998400 * 1000
+  #define JIG_LIMIT_TIME	160
+#else
+  #define JIG_LIMIT_CLK	960000 * 1000
+  #define JIG_LIMIT_TIME	50
+#endif
+	if (jig_boot_clk_limit == 1) {
+		unsigned long long t = sched_clock();
+		do_div(t, 1000000000);
+		if (t <= JIG_LIMIT_TIME && rate > JIG_LIMIT_CLK)
+			rate = JIG_LIMIT_CLK;
+		else if (t > JIG_LIMIT_TIME) {
+			jig_boot_clk_limit = 0;
+		}
+	}
+#endif
 	rate = clk_round_rate(cpu_clk[policy->cpu], rate);
 	ret = clk_set_rate(cpu_clk[policy->cpu], rate);
 	if (!ret) {
@@ -94,11 +116,14 @@ static int msm_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int target_freq,
 				unsigned int relation)
 {
-	int ret = -EFAULT;
+	int ret = 0;
 	int index;
 	struct cpufreq_frequency_table *table;
 
 	mutex_lock(&per_cpu(cpufreq_suspend, policy->cpu).suspend_mutex);
+
+	if (target_freq == policy->cur)
+		goto done;
 
 	if (per_cpu(cpufreq_suspend, policy->cpu).device_suspended) {
 		pr_debug("cpufreq: cpu%d scheduling frequency change "
@@ -262,11 +287,34 @@ static int msm_cpufreq_suspend(void)
 
 static int msm_cpufreq_resume(void)
 {
-	int cpu;
+	int cpu, ret;
+	struct cpufreq_policy policy;
 
 	for_each_possible_cpu(cpu) {
 		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
 	}
+
+	/*
+	 * Freq request might be rejected during suspend, resulting
+	 * in policy->cur violating min/max constraint.
+	 * Correct the frequency as soon as possible.
+	 */
+	get_online_cpus();
+	for_each_online_cpu(cpu) {
+		ret = cpufreq_get_policy(&policy, cpu);
+		if (ret)
+			continue;
+		if (policy.cur <= policy.max && policy.cur >= policy.min)
+			continue;
+		ret = cpufreq_update_policy(cpu);
+		if (ret)
+			pr_info("cpufreq: Current frequency violates policy min/max for CPU%d\n",
+			       cpu);
+		else
+			pr_info("cpufreq: Frequency violation fixed for CPU%d\n",
+				cpu);
+	}
+	put_online_cpus();
 
 	return NOTIFY_DONE;
 }
